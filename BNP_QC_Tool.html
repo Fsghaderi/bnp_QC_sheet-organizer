@@ -183,6 +183,18 @@
     margin-top: 8px;
     word-break: break-all;
   }
+  .upload-error {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--fail);
+    line-height: 1.4;
+  }
+  .upload-warn {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--warn);
+    line-height: 1.4;
+  }
 
   /* ANALYZE BUTTON */
   .btn-analyze {
@@ -205,6 +217,13 @@
   }
   .btn-analyze:hover:not(:disabled) { background: var(--moss); }
   .btn-analyze:disabled { opacity: 0.45; cursor: not-allowed; }
+  .analyze-hint {
+    font-size: 11px;
+    color: var(--dust);
+    margin-top: 8px;
+    line-height: 1.5;
+  }
+  .analyze-hint strong { color: var(--forest); }
 
   /* PROGRESS SUMMARY (sidebar) */
   .progress-card {
@@ -624,12 +643,15 @@
         <div class="upload-label">Drop PDF here or click to browse</div>
         <div class="upload-sub">Cover sheet or full drawing set</div>
         <div class="upload-filename" id="uploadFilename"></div>
+        <div class="upload-error" id="uploadError" style="display:none;"></div>
+        <div class="upload-warn" id="uploadWarn" style="display:none;"></div>
       </div>
     </div>
 
     <button class="btn-analyze" id="analyzeBtn" onclick="runAnalysis()" disabled>
       <span>▶</span> Analyze Drawing Set
     </button>
+    <div class="analyze-hint" id="analyzeHint"></div>
 
     <div id="progressSection" style="display:none;">
       <div class="sidebar-section-title">Review Progress</div>
@@ -665,35 +687,104 @@ let uploadedFile = null;
 let checklistItems = [];
 let projectInfo = {};
 
+// --- SMALL UI HELPERS ---
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+function showBlock(id, isShown) {
+  const el = document.getElementById(id);
+  if (el) el.style.display = isShown ? 'block' : 'none';
+}
+function showUploadError(message) {
+  setText('uploadError', message || '');
+  showBlock('uploadError', !!message);
+}
+function showUploadWarn(message) {
+  setText('uploadWarn', message || '');
+  showBlock('uploadWarn', !!message);
+}
+
 // --- FILE HANDLING ---
 function handleFileSelect(e) {
-  const file = e.target.files[0];
+  const file = e?.target?.files?.[0];
   if (!file) return;
-  uploadedFile = file;
-  document.getElementById('uploadFilename').textContent = file.name;
-  checkAnalyzeReady();
+  acceptUploadedPdf(file, { source: 'browse' });
 }
 
 const uploadZone = document.getElementById('uploadZone');
+
+// Make the whole zone clickable even in environments where the invisible <input> is finicky.
+uploadZone.addEventListener('click', () => {
+  const input = document.getElementById('pdfUpload');
+  if (input) input.click();
+});
+
+// Prevent the browser/editor preview from trying to open the dropped PDF directly.
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => e.preventDefault());
+
 uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
 uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
 uploadZone.addEventListener('drop', e => {
   e.preventDefault();
   uploadZone.classList.remove('drag-over');
-  const file = e.dataTransfer.files[0];
-  if (file && file.type === 'application/pdf') {
-    uploadedFile = file;
-    document.getElementById('uploadFilename').textContent = file.name;
-    checkAnalyzeReady();
-  }
+  const file = e?.dataTransfer?.files?.[0];
+  if (!file) return;
+  acceptUploadedPdf(file, { source: 'drop' });
 });
 
+function acceptUploadedPdf(file, { source }) {
+  // Clear any prior messages so the user sees immediate feedback.
+  showUploadError('');
+  showUploadWarn('');
+
+  // Some environments don't populate file.type reliably; fall back to extension check too.
+  const looksLikePdfByType = (file.type || '').toLowerCase() === 'application/pdf';
+  const looksLikePdfByName = (file.name || '').toLowerCase().endsWith('.pdf');
+  if (!looksLikePdfByType && !looksLikePdfByName) {
+    uploadedFile = null;
+    setText('uploadFilename', '');
+    showUploadError('Please upload a PDF file (.pdf).');
+    checkAnalyzeReady();
+    return;
+  }
+
+  uploadedFile = file;
+  setText('uploadFilename', `Selected: ${file.name}`);
+
+  // Editor “HTML preview” and file:// commonly cause “nothing happens” symptoms.
+  // This warning helps route the user to the simplest reliable way to run it.
+  if (location.protocol === 'file:') {
+    showUploadWarn('Tip: If Analyze seems to do nothing from file://, open this page via a local server (e.g. “Live Server” or “python -m http.server”) and run in Chrome/Edge.');
+  }
+
+  checkAnalyzeReady();
+}
+
 function checkAnalyzeReady() {
-  const ready = uploadedFile && document.getElementById('apiKey').value.trim() && document.getElementById('projectName').value.trim();
+  const apiKey = document.getElementById('apiKey').value.trim();
+  const projectName = document.getElementById('projectName').value.trim();
+
+  const missing = [];
+  if (!apiKey) missing.push('API key');
+  if (!projectName) missing.push('Project name');
+  if (!uploadedFile) missing.push('PDF');
+
+  const ready = missing.length === 0;
   document.getElementById('analyzeBtn').disabled = !ready;
+
+  // Always explain why Analyze is disabled — avoids the “nothing happens” feeling.
+  const hint = ready
+    ? 'Ready to analyze.'
+    : `To enable Analyze, add: <strong>${missing.join(', ')}</strong>.`;
+  document.getElementById('analyzeHint').innerHTML = hint;
 }
 document.getElementById('apiKey').addEventListener('input', checkAnalyzeReady);
 document.getElementById('projectName').addEventListener('input', checkAnalyzeReady);
+
+// Run once on load so the user sees guidance immediately.
+checkAnalyzeReady();
 
 // --- PDF TO BASE64 ---
 function fileToBase64(file) {
@@ -708,7 +799,10 @@ function fileToBase64(file) {
 // --- MAIN ANALYSIS ---
 async function runAnalysis() {
   const apiKey = document.getElementById('apiKey').value.trim();
-  if (!apiKey || !uploadedFile) return;
+  if (!apiKey || !uploadedFile) {
+    checkAnalyzeReady();
+    return;
+  }
 
   projectInfo = {
     name: document.getElementById('projectName').value.trim(),
@@ -846,7 +940,12 @@ Please analyze the attached drawing set PDF and return a JSON QC report followin
     renderResults(result);
 
   } catch (err) {
-    showError(err.message);
+    // When running from an editor preview or file://, network calls can fail in non-obvious ways.
+    const msg = (err && err.message) ? err.message : String(err);
+    const extra = location.protocol === 'file:'
+      ? ' If you opened this as a local file (file://) or in an editor preview, try serving it from a local web server instead.'
+      : '';
+    showError(msg + extra);
   }
 }
 
