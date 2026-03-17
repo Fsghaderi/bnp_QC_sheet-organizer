@@ -172,7 +172,7 @@
     border-color: var(--fern);
     background: rgba(232,242,236,0.6);
   }
-  .upload-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+  .upload-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
   .upload-icon { font-size: 28px; margin-bottom: 8px; }
   .upload-label { font-size: 13px; font-weight: 500; color: var(--moss); }
   .upload-sub { font-size: 11px; color: var(--dust); margin-top: 3px; }
@@ -638,7 +638,7 @@
     <div>
       <div class="sidebar-section-title">Drawing Set PDF</div>
       <div class="upload-zone" id="uploadZone">
-        <input type="file" id="pdfUpload" accept=".pdf" onchange="handleFileSelect(event)">
+        <input type="file" id="pdfUpload" accept=".pdf" onchange="handleFileSelect(event)" onclick="event.stopPropagation()">
         <div class="upload-icon">📄</div>
         <div class="upload-label">Drop PDF here or click to browse</div>
         <div class="upload-sub">Cover sheet or full drawing set</div>
@@ -714,18 +714,31 @@ function handleFileSelect(e) {
 
 const uploadZone = document.getElementById('uploadZone');
 
-// Make the whole zone clickable even in environments where the invisible <input> is finicky.
+// Make the whole zone clickable as a fallback (e.g. if inset:0 doesn't cover a gap).
+// The input has onclick="event.stopPropagation()" so this only fires for clicks on
+// the zone background that somehow miss the invisible input.
 uploadZone.addEventListener('click', () => {
-  const input = document.getElementById('pdfUpload');
-  if (input) input.click();
+  document.getElementById('pdfUpload').click();
 });
 
-// Prevent the browser/editor preview from trying to open the dropped PDF directly.
+// Prevent the browser from navigating to the dropped PDF anywhere on the page.
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => e.preventDefault());
 
-uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
-uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+// Add highlight once when the drag enters the zone (not on every mousemove).
+uploadZone.addEventListener('dragenter', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+
+// Keep drop enabled while hovering (required by spec).
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); });
+
+// Only remove the highlight when the cursor truly leaves the zone
+// (not when it moves over a child element like the label text or icon).
+uploadZone.addEventListener('dragleave', e => {
+  if (!uploadZone.contains(e.relatedTarget)) {
+    uploadZone.classList.remove('drag-over');
+  }
+});
+
 uploadZone.addEventListener('drop', e => {
   e.preventDefault();
   uploadZone.classList.remove('drag-over');
@@ -752,13 +765,6 @@ function acceptUploadedPdf(file, { source }) {
 
   uploadedFile = file;
   setText('uploadFilename', `Selected: ${file.name}`);
-
-  // Editor “HTML preview” and file:// commonly cause “nothing happens” symptoms.
-  // This warning helps route the user to the simplest reliable way to run it.
-  if (location.protocol === 'file:') {
-    showUploadWarn('Tip: If Analyze seems to do nothing from file://, open this page via a local server (e.g. “Live Server” or “python -m http.server”) and run in Chrome/Edge.');
-  }
-
   checkAnalyzeReady();
 }
 
@@ -911,7 +917,7 @@ Please analyze the attached drawing set PDF and return a JSON QC report followin
         'anthropic-dangerous-direct-browser-access': 'true',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 4000,
         system: systemPrompt,
         messages: [{
@@ -928,23 +934,44 @@ Please analyze the attached drawing set PDF and return a JSON QC report followin
     });
 
     if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.error?.message || `API error ${response.status}`);
+      let errMsg;
+      try {
+        const errBody = await response.json();
+        errMsg = errBody.error?.message || `API error ${response.status}`;
+      } catch {
+        errMsg = `API error ${response.status} ${response.statusText}`;
+      }
+      throw new Error(errMsg);
     }
 
     const data = await response.json();
     const rawText = data.content.map(b => b.text || '').join('');
-    const clean = rawText.replace(/```json|```/g, '').trim();
-    const result = JSON.parse(clean);
+    // Extract the outermost JSON object regardless of any surrounding text,
+    // preamble prose, or markdown code fences the model may have added.
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      const preview = rawText.slice(0, 300).replace(/</g, '&lt;');
+      throw new Error(`Model response contained no JSON object. First 300 chars:\n${preview}`);
+    }
+    let result;
+    try {
+      result = JSON.parse(jsonMatch[0]);
+    } catch {
+      const preview = jsonMatch[0].slice(0, 300).replace(/</g, '&lt;');
+      throw new Error(`Could not parse the model response as JSON. First 300 chars received:\n${preview}`);
+    }
 
     renderResults(result);
 
   } catch (err) {
-    // When running from an editor preview or file://, network calls can fail in non-obvious ways.
     const msg = (err && err.message) ? err.message : String(err);
-    const extra = location.protocol === 'file:'
-      ? ' If you opened this as a local file (file://) or in an editor preview, try serving it from a local web server instead.'
-      : '';
+    // Give an extra hint for generic network failures (wrong key, blocked request, etc.)
+    let extra = '';
+    if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+      extra = ' This is usually caused by a network error or an invalid API key. Check the key and try again.';
+    } else if (/401|invalid.*key|authentication/i.test(msg)) {
+      extra = ' Double-check that your Anthropic API key starts with "sk-ant-" and is valid.';
+    }
     showError(msg + extra);
   }
 }
